@@ -43,7 +43,7 @@ sys.path.append(join(dirname(__file__), '.', 'o2dpg_workflow_utils'))
 
 from o2dpg_workflow_utils import createTask, createGlobalInitTask, dump_workflow, adjust_RECO_environment, isActive, activate_detector, deactivate_detector, compute_n_workers, merge_dicts
 from o2dpg_qc_finalization_workflow import include_all_QC_finalization
-from o2dpg_sim_config import create_sim_config, create_geant_config, constructConfigKeyArg, option_if_available, overwrite_config
+from o2dpg_sim_config import create_sim_config, create_geant_config, constructConfigKeyArg, option_if_available, overwrite_config, qed_included
 from o2dpg_dpl_config_tools import dpl_option_from_config, TaskFinalizer, quote_if_needed
 
 # for some JAliEn interaction
@@ -163,6 +163,9 @@ parser.add_argument('--mft-assessment-full', action='store_true', help='enables 
 parser.add_argument('--tpc-distortion-type', default=0, type=int, help='Simulate distortions in the TPC (0=no distortions, 1=distortions without scaling, 2=distortions with CTP scaling)')
 parser.add_argument('--tpc-corrmap-lumi-mode', default=2, type=int, help='TPC corrections mode (0=linear, 1=derivative, 2=derivative for special MC maps')
 parser.add_argument('--ctp-scaler', default=0, type=float, help='CTP raw scaler value used for distortion simulation')
+parser.add_argument('--no-tpc-mt-digitizer', action='store_true', help='Digitize TPC with one process per lane instead of one multithreaded device')
+parser.add_argument('--tpc-mt-digitizer', action='store_true', help=argparse.SUPPRESS) # the default now; kept for compatibility
+parser.add_argument('--tpc-sector-seeding', action='store_true', help='Seed the TPC digitizer per sector so that the digits do not depend on the number of lanes')
 # Global Forward reconstruction configuration
 parser.add_argument('--fwdmatching-assessment-full', action='store_true', help='enables complete assessment of global forward reco')
 parser.add_argument('--fwdmatching-4-param', action='store_true', help='excludes q/pt from matching parameters')
@@ -461,6 +464,9 @@ NWORKERS=args.n_workers
 
 SKIPMODULES = " ".join(["--skipModules"] + args.skipModules) if len(args.skipModules) > 0 else ""
 SIMENGINE=args.e
+# Geant4 is loaded by dlopen and needs a glibc static TLS reserve. It is set per task, because the global
+# environment does not replace a GLIBC_TUNABLES that already exists, as it does truncated in GRID jobs.
+GEANT4_TASK_ENV={'GLIBC_TUNABLES': 'glibc.rtld.optional_static_tls=32768'}
 BFIELD=args.field
 RNDSEED=args.seed # typically the argument should be the jobid, but if we get None the current time is used for the initialisation
 random.seed(RNDSEED)
@@ -476,6 +482,14 @@ GENERATOR=args.gen
 if GENERATOR =='':
    print('o2dpg_sim_workflow: Error! generator name not provided')
    exit(1)
+
+# the multithreaded TPC digitizer is the default; it needs TPC digit chunking
+tpc_mt_digitizer = not args.no_tpc_mt_digitizer and not args.no_tpc_digitchunking
+if args.tpc_mt_digitizer and not tpc_mt_digitizer:
+   print('o2dpg_sim_workflow: Error! --tpc-mt-digitizer conflicts with --no-tpc-mt-digitizer or --no-tpc-digitchunking')
+   exit(1)
+if tpc_mt_digitizer and args.tpc_sector_seeding:
+   print('o2dpg_sim_workflow: --tpc-sector-seeding is implied by --tpc-mt-digitizer')
 
 INIFILE=''
 if args.ini!= '':
@@ -629,11 +643,9 @@ if len(CONFKEYMV) > 0:
 
 workflow['stages'].append(GRP_TASK)
 
-# QED background is enabled by default only for same-species (heavy-ion) collisions.
-# --with-qed forces it on; --no-qed forces it off and wins over both the default and --with-qed
-# (the two flags are mutually exclusive at the argparse level, so they can never both be set).
-QED_enabled = True if (PDGA==PDGB and PDGA!=2212) else False
-includeQED = (QED_enabled or args.with_qed) and not args.no_qed
+# QED background: on by default for same-species heavy-ion collisions, off for MC-DATA embedding;
+# --with-qed forces it on, --no-qed forces it off (see qed_included)
+includeQED = qed_included(PDGA, PDGB, args.with_qed, args.no_qed, args.data_anchoring)
 signalprefix='sgn'
 
 # No vertexing for event pool generation; otherwise the vertex comes from CCDB and later from CollContext
@@ -700,6 +712,10 @@ PreCollContextTask['cmd'] = task_finalizer([
       ' --nontrivial-mu-distribution ccdb://https://alice-ccdb.cern.ch/FT0/Calib/EventsPerBc',
       f'--QEDinteraction {qedspec}' if includeQED else None
       ], configname = 'precollcontext')
+if len(args.data_anchoring) > 0:
+   # contexts taken from data carry no interaction rate; store the one used for this production
+   PreCollContextTask['cmd'] += ' && python3 ${O2DPG_ROOT}/MC/utils/o2dpg_data_embedding_utils.py --set-interaction-rate ' + str(INTRATE) \
+                                + ' --context ' + ' '.join(f'tf{tf}/collisioncontext.root' for tf in range(1, NTIMEFRAMES + 1))
 workflow['stages'].append(PreCollContextTask)
 
 if doembedding:
@@ -787,6 +803,7 @@ if doembedding:
 
         if not isActive('all'):
            BKGtask['cmd'] += ' --readoutDetectors ' + " ".join(activeDetectors)
+        BKGtask['env'] = dict(GEANT4_TASK_ENV)
 
         workflow['stages'].append(BKGtask)
 
@@ -973,7 +990,7 @@ for tf in range(1, NTIMEFRAMES + 1):
        if eventOffset == None:
         eventOffset = 0
        cmd = 'export HEPMCEVENTSKIP=$(${O2DPG_ROOT}/UTILS/InitHepMCEventSkip.sh ../HepMCEventSkip.json ' + str(eventOffset) + ');'
-     elif tf > 1:
+     else:
        # determine the skip number
        cmd = 'export HEPMCEVENTSKIP=$(${O2DPG_ROOT}/UTILS/ReadHepMCEventSkip.sh ../HepMCEventSkip.json ' + str(tf) + ');'
      SGNGENtask['cmd'] = cmd
@@ -991,6 +1008,7 @@ for tf in range(1, NTIMEFRAMES + 1):
                      + ' --seed ' + str(TFSEED) + ' -n ' + str(NSIGEVENTS)                            \
                      + ' --detectorList ' + args.detectorList                                         \
                      + ' --fromCollContext collisioncontext.root:' + signalprefix
+   SGNGENtask['env'] = dict(GEANT4_TASK_ENV)
    if GENERATOR=="hepmc":
       SGNGENtask['cmd'] += "; RC=$?; ${O2DPG_ROOT}/UTILS/UpdateHepMCEventSkip.sh ../HepMCEventSkip.json " + str(tf) + '; [[ ${RC} == 0 ]]'
    if sep_event_mode == True:
@@ -1021,6 +1039,7 @@ for tf in range(1, NTIMEFRAMES + 1):
       SGNtask['cmd'] += ' --readoutDetectors ' + " ".join(activeDetectors)
 
    SGNtask['cmd'] += ' --fromCollContext collisioncontext.root'
+   SGNtask['env'] = dict(GEANT4_TASK_ENV)
    workflow['stages'].append(SGNtask)
 
    # some tasks further below still want geometry + grp in fixed names, so we provide it here
@@ -1166,12 +1185,17 @@ for tf in range(1, NTIMEFRAMES + 1):
    TPCDigitask['cmd'] += '${O2_ROOT}/bin/o2-ccdb-downloadccdbfile --host http://alice-ccdb.cern.ch -p TPC/Config/RunInfoV2 --timestamp '   \
                          + str(args.timestamp) + ' --created-not-after ' + str(args.condition_not_after) + ' -d ${ALICEO2_CCDB_LOCALCACHE} ; '
    TPCDigitask['cmd'] += '${O2_ROOT}/bin/o2-sim-digitizer-workflow ' + getDPL_global_options(bigshm=True) + ' -n ' + str(args.ns) + simsoption       \
-                         + ' --onlyDet TPC --TPCuseCCDB --interactionRate ' + str(INTRATE) + '  --tpc-lanes ' + str(NWORKERS_TF)             \
+                         + ' --onlyDet TPC --TPCuseCCDB --interactionRate ' + str(INTRATE)                                                \
                          + ' --incontext ' + str(CONTEXTFILE) + ' --disable-write-ini --early-forward-policy always --forceSelectedDets ' \
                          + ' --tpc-distortion-type ' + str(tpcDistortionType)                                                             \
-                         + ' --n-threads-distortions 1 '                                                                                  \
                          + putConfigValues(["TPCGasParam","TPCGEMParam","TPCEleParam","TPCITCorr","TPCDetParam"],
                                               localCF=tpcLocalCF)
+   if tpc_mt_digitizer:
+      # one device with NWORKERS_TF threads; it always seeds per sector
+      TPCDigitask['cmd'] += ' --tpc-digi-threads ' + str(NWORKERS_TF) + ' --n-threads-distortions ' + str(NWORKERS_TF)
+   else:
+      TPCDigitask['cmd'] += ' --tpc-lanes ' + str(NWORKERS_TF) + ' --n-threads-distortions 1'
+      TPCDigitask['cmd'] += ('',' --tpc-sector-seeding')[args.tpc_sector_seeding]
    TPCDigitask['cmd'] += (' --tpc-chunked-writer','')[args.no_tpc_digitchunking]
    TPCDigitask['cmd'] += ('',' --disable-mc')[args.no_mc_labels]
    # we add any other extra command line options (power user customization) with an environment variable
@@ -1378,13 +1402,13 @@ for tf in range(1, NTIMEFRAMES + 1):
    if not isActive('CTP'):
       # CTP digits won't be produced for this timeframe (CTP not in the readout detector list)
       tpc_corr_scaling_options += ' --disable-ctp-lumi-request'
-      
+
    # why not simply?
    # tpc_corr_scaling_options = ('--lumi-type 1', '')[tpcDistortionType != 0]
 
    # at the moment MC is not ready for the sector edge fluctuations (RS: and does not use IDC but --disable-IDC-scalers can be added only once it is added by the CorrectionMapsOptions::addGlobalOptions)
    tpc_corr_scaling_options += option_if_available('o2-tpc-reco-workflow', '--disable-sec-edge-fluc-correction', envfile=async_envfile)
-   
+
    #<--------- TPC reco task
    if includeTPCSyncMode:
       tpcSyncreconeeds = tpcreconeeds.copy()
@@ -1745,19 +1769,21 @@ for tf in range(1, NTIMEFRAMES + 1):
    pvfinder_matching_sources = cleanDetectorInputList(pvfinder_matching_sources)
 
    pvfinderneeds = [TRDTRACKINGtask2['name'] if isActive("TRD") else None,
+                    ITSRECOtask['name'] if isActive("ITS") else None,
+                    TPCRECOtask['name'] if isActive("TPC") else None,
+                    MFTRECOtask['name'] if isActive("MFT") else None,
+                    MCHRECOtask['name'] if isActive("MCH") else None,
                     FT0RECOtask['name'] if isActive("FT0") else None,
                     FV0RECOtask['name'] if isActive("FV0") else None,
                     EMCRECOtask['name'] if isActive("EMC") else None,
                     PHSRECOtask['name'] if isActive("PHS") else None,
                     CPVRECOtask['name'] if isActive("CPV") else None,
                     FDDRECOtask['name'] if isActive("FDD") else None,
-                    ZDCRECOtask['name'] if isActive("ZDC") else None,
-                    HMPMATCHtask['name'] if isActive("HMP") else None,
                     ITSTPCMATCHtask['name'] if isActive("ITS") and isActive("TPC") else None,
                     TOFTPCMATCHERtask['name'] if isActive("TPC") and isActive("TOF") else None,
                     MFTMCHMATCHtask['name'] if isActive("MFT") and isActive("MCH") else None,
                     MCHMIDMATCHtask['name'] if isActive("MCH") and isActive("MID") else None]
-   pvfinderneeds = [ p for p in pvfinderneeds if p != None ]
+   pvfinderneeds = [p for p in pvfinderneeds if p != None]
 
    PVFINDERtask = createTask(name='pvfinder_'+str(tf), needs=pvfinderneeds, tf=tf, cwd=timeframeworkdir, lab=["RECO"], cpu=NWORKERS_TF, mem='4000')
    PVFINDERtask['cmd'] = task_finalizer(
@@ -1810,7 +1836,10 @@ for tf in range(1, NTIMEFRAMES + 1):
    aod_info_souces_default = 'ITS-TPC,TPC-TRD,ITS-TPC-TRD,TPC-TOF,ITS-TPC-TOF,TPC-TRD-TOF,ITS-TPC-TRD-TOF,MFT-MCH,MCH-MID,ITS,MFT,TPC,TOF,FT0,MID,EMC,PHS,CPV,ZDC,FDD,HMP,FV0,TRD,MCH,CTP'
    aodinfosources = dpl_option_from_config(anchorConfig, 'o2-aod-producer-workflow', '--info-sources', default_value=aod_info_souces_default)
    aodinfosources = cleanDetectorInputList(aodinfosources)
-   aodneeds = [PVFINDERtask['name'], SVFINDERtask['name']]
+   aodneeds = [PVFINDERtask['name'], SVFINDERtask['name'],
+               HMPMATCHtask['name'] if isActive("HMP") else None,
+               ZDCRECOtask['name'] if isActive("ZDC") else None,
+               MIDRECOtask['name'] if isActive("MID") else None]
 
    if usebkgcache:
      aodneeds += [ BKG_KINEDOWNLOADER_TASK['name'] ]
@@ -1969,10 +1998,10 @@ for tf in range(1, NTIMEFRAMES + 1):
      if isActive("MFT") and not staggMFT:
        for flp in range(5):
          addQCPerTF(taskName='mftDigitsQC' + str(flp),
-                  needs=[getDigiTaskName("MFT")],
-                  readerCommand='o2-qc-mft-digits-root-file-reader --mft-digit-infile=mftdigits.root' + staggMFT,
-                  configFilePath='json://${O2DPG_ROOT}/MC/config/QC/json/mft-digits-' + str(flp) + '.json',
-                  objectsFile='mftDigitsQC.root')
+                    needs=[getDigiTaskName("MFT")],
+                    readerCommand='o2-itsmft-digit-reader-workflow --runmft --disable-mc --suppress-triggers-output --mft-digit-infile mftdigits.root' + staggMFT,
+                    configFilePath='json://${O2DPG_ROOT}/MC/config/QC/json/mft-digits-' + str(flp) + '.json',
+                    objectsFile='mftDigitsQC.root')
        addQCPerTF(taskName='mftClustersQC',
                 needs=[MFTRECOtask['name']],
                 readerCommand='o2-global-track-cluster-reader --track-types none --cluster-types MFT' + staggMFT,
